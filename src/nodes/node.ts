@@ -1,48 +1,142 @@
 import bodyParser from "body-parser";
 import express from "express";
 import { BASE_NODE_PORT } from "../config";
-import { Value } from "../types";
+import { Value, NodeState } from "../types";
 
 export async function node(
-  nodeId: number, // the ID of the node
-  N: number, // total number of nodes in the network
-  F: number, // number of faulty nodes in the network
-  initialValue: Value, // initial value of the node
-  isFaulty: boolean, // true if the node is faulty, false otherwise
-  nodesAreReady: () => boolean, // used to know if all nodes are ready to receive requests
-  setNodeIsReady: (index: number) => void // this should be called when the node is started and ready to receive requests
+  nodeId: number,
+  N: number,
+  F: number,
+  initialValue: Value,
+  isFaulty: boolean,
+  nodesAreReady: () => boolean,
+  setNodeIsReady: (index: number) => void
 ) {
   const node = express();
   node.use(express.json());
   node.use(bodyParser.json());
 
-  // TODO implement this
-  // this route allows retrieving the current status of the node
-  // node.get("/status", (req, res) => {});
+  const createInitialNodeState = (): NodeState => ({
+    killed: false,
+    x: isFaulty ? null : initialValue,
+    decided: isFaulty ? null : false,
+    k: isFaulty ? null : 0
+  });
 
-  // TODO implement this
-  // this route allows the node to receive messages from other nodes
-  // node.post("/message", (req, res) => {});
+  let nodeState: NodeState = createInitialNodeState();
+  let phase1Messages: (Value | null)[] = Array(N).fill(null);
+  let phase2Messages: (Value | null)[] = Array(N).fill(null);
+  let receivedValues: (Value | null)[] = Array(N).fill(null);
+  receivedValues[nodeId] = initialValue;
 
-  // TODO implement this
-  // this route is used to start the consensus algorithm
-  // node.get("/start", async (req, res) => {});
+  const computeMajorityValue = (messages: (Value | null)[]) => {
+    const counts = [0, 0];
+    messages.forEach(msg => {
+      if (msg !== null) {
+        counts[msg as number]++;
+      }
+    });
+    
+    return counts[0] > (N - F) / 2 ? 0 
+         : counts[1] > (N - F) / 2 ? 1 
+         : 1; // default to 1 if no clear majority
+  };
 
-  // TODO implement this
-  // this route is used to stop the consensus algorithm
-  // node.get("/stop", async (req, res) => {});
+  const sendMessageToAll = async (phase: number, k: number, x: Value) => {
+    const promises = [];
+    for (let i = 0; i < N; i++) {
+      if (i !== nodeId) {
+        promises.push(
+          fetch(`http://localhost:${BASE_NODE_PORT + i}/message`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ 
+              senderId: nodeId, 
+              value: { phase, k, x } 
+            })
+          })
+        );
+      }
+    }
+    await Promise.all(promises);
+  };
 
-  // TODO implement this
-  // get the current state of a node
-  // node.get("/getState", (req, res) => {});
+  const resetMessagesForNewRound = () => {
+    phase1Messages = Array(N).fill(null);
+    phase2Messages = Array(N).fill(null);
+  };
 
-  // start the server
+  // Status routes
+  node.get("/status", (req, res) => {
+    res.status(isFaulty ? 500 : 200).send(isFaulty ? "faulty" : "live");
+    return res; 
+  });
+
+  node.get("/getState", (req, res) => {
+    return res.status(200).json(nodeState);
+  });
+
+  // Message handling route
+  node.post("/message", (req, res) => {
+    if (nodeState.killed || nodeState.decided) {
+      return res.status(500).send("Node is killed or has decided");
+    }
+
+    if (isFaulty) {
+      return res.status(200).send("Message received by faulty node");
+    }
+
+    const { senderId, value } = req.body;
+    const { phase, k, x } = value;
+
+    if (nodeState.k === k) {
+      if (phase === 1) phase1Messages[senderId] = x;
+      if (phase === 2) phase2Messages[senderId] = x;
+    }
+
+    return res.status(200).send("Message received");
+  });
+
+  // Consensus start route
+  node.get("/start", async (req, res) => {
+    if (isFaulty || nodeState.killed || nodeState.k == null || nodeState.x == null) {
+      return res.status(500).send("Node is faulty or killed");
+    }
+
+    while (!nodeState.decided && !nodeState.killed && (nodeState.k ?? 0) <= 12) {
+      nodeState.k = (nodeState.k ?? 0) + 1;
+      resetMessagesForNewRound();
+
+      // PHASE 1
+      await sendMessageToAll(1, nodeState.k, nodeState.x);
+      const majorityValue1 = computeMajorityValue(phase1Messages);
+
+      // PHASE 2
+      await sendMessageToAll(2, nodeState.k, majorityValue1);
+      
+      // Handle fault scenarios
+      if ((F * 2) >= N) {
+        nodeState.x = Math.floor(Math.random() * 2) as Value;
+        continue;
+      }
+
+      // Determine final value
+      const majorityValue2 = computeMajorityValue(phase2Messages);
+      nodeState.x = majorityValue2;
+      nodeState.decided = true;
+    }
+
+    return res.status(200).send("Consensus started");
+  });
+
+  // Stop route
+  node.get("/stop", async (req, res) => {
+    nodeState.killed = true;
+    return res.status(200).send("Consensus stopped");
+  });
+
+  // Start server
   const server = node.listen(BASE_NODE_PORT + nodeId, async () => {
-    console.log(
-      `Node ${nodeId} is listening on port ${BASE_NODE_PORT + nodeId}`
-    );
-
-    // the node is ready
     setNodeIsReady(nodeId);
   });
 
